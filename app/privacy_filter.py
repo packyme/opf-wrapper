@@ -3,7 +3,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 
 import numpy as np
-from optimum.onnxruntime import ORTModelForTokenClassification
+import onnxruntime as ort
 from transformers import PretrainedConfig, PreTrainedTokenizerFast
 
 from app.config import MODEL_PATH, N_CTX, ONNX_FILE, ONNX_SUBFOLDER, PROVIDER
@@ -18,8 +18,33 @@ from app.schemas import Detection
 
 
 @dataclass(frozen=True)
+class OnnxTokenClassifier:
+    session: ort.InferenceSession
+    input_names: frozenset[str]
+    output_names: tuple[str, ...]
+
+    def logits(self, input_ids: np.ndarray, attention_mask: np.ndarray) -> np.ndarray:
+        model_inputs = self.build_inputs(input_ids, attention_mask)
+        outputs = self.session.run(list(self.output_names), model_inputs)
+        if "logits" not in self.output_names:
+            return outputs[0]
+        return outputs[self.output_names.index("logits")]
+
+    def build_inputs(self, input_ids: np.ndarray, attention_mask: np.ndarray) -> dict[str, np.ndarray]:
+        if "input_ids" not in self.input_names:
+            raise ValueError("ONNX model is missing required input: input_ids")
+
+        model_inputs = {"input_ids": input_ids}
+        if "attention_mask" in self.input_names:
+            model_inputs["attention_mask"] = attention_mask
+        if "token_type_ids" in self.input_names:
+            model_inputs["token_type_ids"] = np.zeros_like(input_ids, dtype=np.int64)
+        return model_inputs
+
+
+@dataclass(frozen=True)
 class PrivacyFilterRuntime:
-    model: ORTModelForTokenClassification
+    model: OnnxTokenClassifier
     tokenizer: PreTrainedTokenizerFast
     decoder: ViterbiDecoder
     n_ctx: int
@@ -35,23 +60,24 @@ def load_classifier() -> PrivacyFilterRuntime:
         return _runtime
 
     ensure_model_dir()
-    model_path = str(MODEL_PATH)
-
     config = PretrainedConfig.from_json_file(str(MODEL_PATH / "config.json"))
     tokenizer = load_tokenizer()
     n_ctx = resolve_n_ctx(config)
     label_info = build_label_info(config.id2label)
     decoder = ViterbiDecoder(label_info=label_info, **load_viterbi_biases())
-    model = ORTModelForTokenClassification.from_pretrained(
-        model_path,
-        config=config,
-        subfolder=ONNX_SUBFOLDER,
-        file_name=ONNX_FILE,
-        provider=PROVIDER,
-        local_files_only=True,
-    )
+    model = load_onnx_model()
     _runtime = PrivacyFilterRuntime(model=model, tokenizer=tokenizer, decoder=decoder, n_ctx=n_ctx)
     return _runtime
+
+
+def load_onnx_model() -> OnnxTokenClassifier:
+    onnx_file = MODEL_PATH / ONNX_SUBFOLDER / ONNX_FILE
+    session = ort.InferenceSession(str(onnx_file), providers=[PROVIDER])
+    input_names = frozenset(input_meta.name for input_meta in session.get_inputs())
+    output_names = tuple(output_meta.name for output_meta in session.get_outputs())
+    if not output_names:
+        raise ValueError("ONNX model has no outputs")
+    return OnnxTokenClassifier(session=session, input_names=input_names, output_names=output_names)
 
 
 def load_tokenizer() -> PreTrainedTokenizerFast:
@@ -185,7 +211,7 @@ def aggregate_token_logprobs(
     for window_start, window_tokens in iter_windows(token_ids, runtime.n_ctx):
         input_ids = np.asarray([window_tokens], dtype=np.int64)
         attention_mask = np.ones_like(input_ids, dtype=np.int64)
-        logits = runtime.model(input_ids=input_ids, attention_mask=attention_mask).logits[0]
+        logits = runtime.model.logits(input_ids=input_ids, attention_mask=attention_mask)[0]
         logprobs = log_softmax(logits.astype(np.float32, copy=False), axis=-1)
         if logprobs.shape[0] != len(window_tokens):
             raise ValueError("Logprob output length does not match window length")

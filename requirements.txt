@@ -2,6 +2,6 @@ fastapi
 uvicorn[standard]
 pydantic
 transformers
-optimum[onnxruntime]
+onnxruntime
 huggingface_hub
 tqdm
