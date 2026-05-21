@@ -90,6 +90,11 @@ def install_torch_dynamo_stub(torch: Any) -> None:
     def identity(function: Any) -> Any:
         return function
 
+    def disable(function: Any = None, *_args: Any, **_kwargs: Any) -> Any:
+        if function is None:
+            return identity
+        return function
+
     def mark_static_address(*_args: Any, **_kwargs: Any) -> None:
         return None
 
@@ -102,6 +107,7 @@ def install_torch_dynamo_stub(torch: Any) -> None:
 
     dynamo.allow_in_graph = identity
     dynamo.assume_constant_result = identity
+    dynamo.disable = disable
     dynamo.mark_static_address = mark_static_address
     trace_wrapped.TransformGetItemToIndex = TransformGetItemToIndex
     dynamo._trace_wrapped_higher_order_op = trace_wrapped
