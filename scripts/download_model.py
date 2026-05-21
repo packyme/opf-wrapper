@@ -1,6 +1,6 @@
 from huggingface_hub import snapshot_download
 
-from app.config import MODEL_ID, MODEL_PATH, ONNX_FILE, ONNX_SUBFOLDER, REVISION
+from app.config import MODEL_FILE, MODEL_ID, MODEL_PATH, REVISION
 
 
 def main() -> None:
@@ -12,16 +12,15 @@ def main() -> None:
         local_dir=str(MODEL_PATH),
         allow_patterns=[
             "config.json",
+            MODEL_FILE,
             "tokenizer.json",
             "tokenizer_config.json",
             "viterbi_calibration.json",
-            f"{ONNX_SUBFOLDER}/{ONNX_FILE}",
-            f"{ONNX_SUBFOLDER}/{ONNX_FILE}_data*",
         ],
     )
 
     print(f"Downloaded {MODEL_ID}@{REVISION} to {MODEL_PATH}")
-    print(f"ONNX file: {ONNX_SUBFOLDER}/{ONNX_FILE}")
+    print(f"Model file: {MODEL_FILE}")
 
 
 if __name__ == "__main__":

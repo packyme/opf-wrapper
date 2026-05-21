@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
 
-from app.config import MODEL_ID, MODEL_PATH, ONNX_FILE, ONNX_SUBFOLDER, PROVIDER
+from app.config import DEVICE, MODEL_FILE, MODEL_ID, MODEL_PATH
 from app.privacy_filter import is_classifier_loaded, load_classifier, redact_text, run_detection
 from app.schemas import DetectRequest, DetectResponse, RedactRequest, RedactResponse
 
@@ -23,9 +23,10 @@ def health() -> dict[str, str]:
         "status": "ok",
         "model": MODEL_ID,
         "model_path": str(MODEL_PATH),
+        "weights": MODEL_FILE,
         "model_loaded": str(is_classifier_loaded()).lower(),
-        "onnx": f"{ONNX_SUBFOLDER}/{ONNX_FILE}",
-        "provider": PROVIDER,
+        "backend": "pytorch",
+        "device": DEVICE,
     }
 
 

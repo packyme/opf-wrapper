@@ -1,7 +1,8 @@
 fastapi
 uvicorn[standard]
 pydantic
-transformers
-onnxruntime
+transformers>=5.6.0
+torch
+safetensors
 huggingface_hub
 tqdm

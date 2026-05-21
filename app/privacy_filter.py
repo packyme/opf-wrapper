@@ -1,12 +1,12 @@
 import json
 from collections.abc import Iterator
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
-import onnxruntime as ort
-from transformers import PretrainedConfig, PreTrainedTokenizerFast
+from transformers import AutoConfig, PreTrainedTokenizerFast
 
-from app.config import MODEL_PATH, N_CTX, ONNX_FILE, ONNX_SUBFOLDER, PROVIDER
+from app.config import DEVICE, MODEL_FILE, MODEL_PATH, N_CTX
 from app.decoder import (
     VITERBI_BIAS_KEYS,
     ViterbiDecoder,
@@ -18,33 +18,26 @@ from app.schemas import Detection
 
 
 @dataclass(frozen=True)
-class OnnxTokenClassifier:
-    session: ort.InferenceSession
-    input_names: frozenset[str]
-    output_names: tuple[str, ...]
+class PyTorchTokenClassifier:
+    model: Any
+    device: Any
+    torch: Any
 
     def logits(self, input_ids: np.ndarray, attention_mask: np.ndarray) -> np.ndarray:
-        model_inputs = self.build_inputs(input_ids, attention_mask)
-        outputs = self.session.run(list(self.output_names), model_inputs)
-        if "logits" not in self.output_names:
-            return outputs[0]
-        return outputs[self.output_names.index("logits")]
+        model_inputs = {
+            "input_ids": self.torch.as_tensor(input_ids, dtype=self.torch.long, device=self.device),
+            "attention_mask": self.torch.as_tensor(attention_mask, dtype=self.torch.long, device=self.device),
+        }
 
-    def build_inputs(self, input_ids: np.ndarray, attention_mask: np.ndarray) -> dict[str, np.ndarray]:
-        if "input_ids" not in self.input_names:
-            raise ValueError("ONNX model is missing required input: input_ids")
+        with self.torch.inference_mode():
+            outputs = self.model(**model_inputs)
 
-        model_inputs = {"input_ids": input_ids}
-        if "attention_mask" in self.input_names:
-            model_inputs["attention_mask"] = attention_mask
-        if "token_type_ids" in self.input_names:
-            model_inputs["token_type_ids"] = np.zeros_like(input_ids, dtype=np.int64)
-        return model_inputs
+        return outputs.logits.detach().float().cpu().numpy()
 
 
 @dataclass(frozen=True)
 class PrivacyFilterRuntime:
-    model: OnnxTokenClassifier
+    model: PyTorchTokenClassifier
     tokenizer: PreTrainedTokenizerFast
     decoder: ViterbiDecoder
     n_ctx: int
@@ -60,24 +53,39 @@ def load_classifier() -> PrivacyFilterRuntime:
         return _runtime
 
     ensure_model_dir()
-    config = PretrainedConfig.from_json_file(str(MODEL_PATH / "config.json"))
+    config = AutoConfig.from_pretrained(str(MODEL_PATH))
     tokenizer = load_tokenizer()
     n_ctx = resolve_n_ctx(config)
     label_info = build_label_info(config.id2label)
     decoder = ViterbiDecoder(label_info=label_info, **load_viterbi_biases())
-    model = load_onnx_model()
+    model = load_pytorch_model()
     _runtime = PrivacyFilterRuntime(model=model, tokenizer=tokenizer, decoder=decoder, n_ctx=n_ctx)
     return _runtime
 
 
-def load_onnx_model() -> OnnxTokenClassifier:
-    onnx_file = MODEL_PATH / ONNX_SUBFOLDER / ONNX_FILE
-    session = ort.InferenceSession(str(onnx_file), providers=[PROVIDER])
-    input_names = frozenset(input_meta.name for input_meta in session.get_inputs())
-    output_names = tuple(output_meta.name for output_meta in session.get_outputs())
-    if not output_names:
-        raise ValueError("ONNX model has no outputs")
-    return OnnxTokenClassifier(session=session, input_names=input_names, output_names=output_names)
+def load_pytorch_model() -> PyTorchTokenClassifier:
+    try:
+        import torch
+        from transformers import AutoModelForTokenClassification
+    except ImportError as exc:
+        raise RuntimeError("PyTorch is required to load model.safetensors. Install requirements.txt first.") from exc
+
+    device = resolve_device(torch)
+    model = AutoModelForTokenClassification.from_pretrained(str(MODEL_PATH))
+    model.to(device)
+    model.eval()
+    return PyTorchTokenClassifier(model=model, device=device, torch=torch)
+
+
+def resolve_device(torch: Any) -> Any:
+    if DEVICE != "auto":
+        return torch.device(DEVICE)
+
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
 
 
 def load_tokenizer() -> PreTrainedTokenizerFast:
@@ -109,7 +117,7 @@ def load_viterbi_biases() -> dict[str, float]:
     return {key: float(biases.get(key, 0.0)) for key in VITERBI_BIAS_KEYS}
 
 
-def resolve_n_ctx(config: PretrainedConfig) -> int:
+def resolve_n_ctx(config: Any) -> int:
     if N_CTX is not None:
         try:
             value = int(N_CTX)
@@ -119,7 +127,7 @@ def resolve_n_ctx(config: PretrainedConfig) -> int:
             raise ValueError("OPF_N_CTX must be a positive integer")
         return value
 
-    if PROVIDER == "CPUExecutionProvider":
+    if DEVICE == "cpu":
         return 4096
 
     for field_name in ("default_n_ctx", "initial_context_length", "max_position_embeddings"):
@@ -136,8 +144,7 @@ def resolve_n_ctx(config: PretrainedConfig) -> int:
 
 
 def ensure_model_dir() -> None:
-    onnx_dir = MODEL_PATH / ONNX_SUBFOLDER
-    onnx_dir.mkdir(parents=True, exist_ok=True)
+    MODEL_PATH.mkdir(parents=True, exist_ok=True)
 
     config_file = MODEL_PATH / "config.json"
     if not config_file.exists():
@@ -151,11 +158,11 @@ def ensure_model_dir() -> None:
     if not tokenizer_config_file.exists():
         raise FileNotFoundError(f"Tokenizer config file not found: {tokenizer_config_file}")
 
-    onnx_file = onnx_dir / ONNX_FILE
-    if onnx_file.exists():
+    model_file = MODEL_PATH / MODEL_FILE
+    if model_file.exists():
         return
 
-    raise FileNotFoundError(f"ONNX model file not found: {onnx_file}")
+    raise FileNotFoundError(f"PyTorch model file not found: {model_file}")
 
 
 def get_classifier() -> PrivacyFilterRuntime:

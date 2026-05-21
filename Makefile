@@ -6,7 +6,7 @@ PORT ?= 8000
 
 help:
 	@echo "Available targets:"
-	@echo "  make download-model  Download the ONNX q4 model into ./model"
+	@echo "  make download-model  Download the PyTorch model into ./model"
 	@echo "  make run             Start the FastAPI server"
 	@echo "  make benchmark       Benchmark the running HTTP server"
 	@echo "  make benchmark ARGS=\"--text-mode long --long-chars 120000 --requests 5\""

@@ -9,7 +9,6 @@ MODEL_PATH = Path(os.getenv("OPF_MODEL_PATH", "./model")).expanduser()
 if not MODEL_PATH.is_absolute():
     MODEL_PATH = PROJECT_ROOT / MODEL_PATH
 MODEL_PATH = MODEL_PATH.resolve()
-ONNX_SUBFOLDER = os.getenv("OPF_ONNX_SUBFOLDER", "onnx")
-ONNX_FILE = os.getenv("OPF_ONNX_FILE", "model_q4.onnx")
-PROVIDER = os.getenv("OPF_PROVIDER", "CPUExecutionProvider")
+MODEL_FILE = os.getenv("OPF_MODEL_FILE", "model.safetensors")
+DEVICE = os.getenv("OPF_DEVICE", "cpu")
 N_CTX = os.getenv("OPF_N_CTX")
