@@ -1,6 +1,8 @@
 import json
+import sys
 from collections.abc import Iterator
 from dataclasses import dataclass
+from types import ModuleType
 from typing import Any
 
 import numpy as np
@@ -66,6 +68,7 @@ def load_classifier() -> PrivacyFilterRuntime:
 def load_pytorch_model() -> PyTorchTokenClassifier:
     try:
         import torch
+        install_torch_dynamo_stub(torch)
         from transformers import AutoModelForTokenClassification
     except ImportError as exc:
         raise RuntimeError("PyTorch is required to load model.safetensors. Install requirements.txt first.") from exc
@@ -75,6 +78,37 @@ def load_pytorch_model() -> PyTorchTokenClassifier:
     model.to(device)
     model.eval()
     return PyTorchTokenClassifier(model=model, device=device, torch=torch)
+
+
+def install_torch_dynamo_stub(torch: Any) -> None:
+    if "torch._dynamo" in sys.modules:
+        return
+
+    dynamo = ModuleType("torch._dynamo")
+    trace_wrapped = ModuleType("torch._dynamo._trace_wrapped_higher_order_op")
+
+    def identity(function: Any) -> Any:
+        return function
+
+    def mark_static_address(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    class TransformGetItemToIndex:
+        def __enter__(self) -> "TransformGetItemToIndex":
+            return self
+
+        def __exit__(self, *_args: Any) -> bool:
+            return False
+
+    dynamo.allow_in_graph = identity
+    dynamo.assume_constant_result = identity
+    dynamo.mark_static_address = mark_static_address
+    trace_wrapped.TransformGetItemToIndex = TransformGetItemToIndex
+    dynamo._trace_wrapped_higher_order_op = trace_wrapped
+
+    sys.modules["torch._dynamo"] = dynamo
+    sys.modules["torch._dynamo._trace_wrapped_higher_order_op"] = trace_wrapped
+    torch._dynamo = dynamo
 
 
 def resolve_device(torch: Any) -> Any:
