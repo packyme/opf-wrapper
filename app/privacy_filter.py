@@ -8,7 +8,7 @@ from typing import Any
 import numpy as np
 from transformers import AutoConfig, PreTrainedTokenizerFast
 
-from app.config import DEVICE, MODEL_FILE, MODEL_PATH, N_CTX
+from app.config import DEVICE, INFERENCE_BATCH_SIZE, MODEL_FILE, MODEL_PATH, N_CTX
 from app.decoder import (
     VITERBI_BIAS_KEYS,
     ViterbiDecoder,
@@ -43,6 +43,7 @@ class PrivacyFilterRuntime:
     tokenizer: PreTrainedTokenizerFast
     decoder: ViterbiDecoder
     n_ctx: int
+    inference_batch_size: int
 
 
 _runtime: PrivacyFilterRuntime | None = None
@@ -58,10 +59,17 @@ def load_classifier() -> PrivacyFilterRuntime:
     config = AutoConfig.from_pretrained(str(MODEL_PATH))
     tokenizer = load_tokenizer()
     n_ctx = resolve_n_ctx(config)
+    inference_batch_size = resolve_inference_batch_size()
     label_info = build_label_info(config.id2label)
     decoder = ViterbiDecoder(label_info=label_info, **load_viterbi_biases())
     model = load_pytorch_model()
-    _runtime = PrivacyFilterRuntime(model=model, tokenizer=tokenizer, decoder=decoder, n_ctx=n_ctx)
+    _runtime = PrivacyFilterRuntime(
+        model=model,
+        tokenizer=tokenizer,
+        decoder=decoder,
+        n_ctx=n_ctx,
+        inference_batch_size=inference_batch_size,
+    )
     return _runtime
 
 
@@ -183,6 +191,17 @@ def resolve_n_ctx(config: Any) -> int:
     return 4096
 
 
+def resolve_inference_batch_size() -> int:
+    try:
+        value = int(INFERENCE_BATCH_SIZE)
+    except ValueError:
+        raise ValueError("OPF_INFERENCE_BATCH_SIZE must be a positive integer") from None
+
+    if value <= 0:
+        raise ValueError("OPF_INFERENCE_BATCH_SIZE must be a positive integer")
+    return value
+
+
 def ensure_model_dir() -> None:
     MODEL_PATH.mkdir(parents=True, exist_ok=True)
 
@@ -255,22 +274,25 @@ def aggregate_token_logprobs(
     logprob_logsumexp: list[np.ndarray | None] = [None] * len(token_ids)
     counts = [0] * len(token_ids)
 
-    for window_start, window_tokens in iter_windows(token_ids, runtime.n_ctx):
-        input_ids = np.asarray([window_tokens], dtype=np.int64)
-        attention_mask = np.ones_like(input_ids, dtype=np.int64)
-        logits = runtime.model.logits(input_ids=input_ids, attention_mask=attention_mask)[0]
-        logprobs = log_softmax(logits.astype(np.float32, copy=False), axis=-1)
-        if logprobs.shape[0] != len(window_tokens):
-            raise ValueError("Logprob output length does not match window length")
+    windows = iter_windows(token_ids, runtime.n_ctx)
+    for window_batch in iter_batches(windows, runtime.inference_batch_size):
+        input_ids, attention_mask = build_batch_inputs(window_batch)
+        batch_logits = runtime.model.logits(input_ids=input_ids, attention_mask=attention_mask)
 
-        for token_pos, score_vector in enumerate(logprobs):
-            token_index = window_start + token_pos
-            existing = logprob_logsumexp[token_index]
-            if existing is None:
-                logprob_logsumexp[token_index] = score_vector.copy()
-            else:
-                logprob_logsumexp[token_index] = np.logaddexp(existing, score_vector)
-            counts[token_index] += 1
+        for batch_index, (window_start, window_tokens) in enumerate(window_batch):
+            logits = batch_logits[batch_index, : len(window_tokens)]
+            logprobs = log_softmax(logits.astype(np.float32, copy=False), axis=-1)
+            if logprobs.shape[0] != len(window_tokens):
+                raise ValueError("Logprob output length does not match window length")
+
+            for token_pos, score_vector in enumerate(logprobs):
+                token_index = window_start + token_pos
+                existing = logprob_logsumexp[token_index]
+                if existing is None:
+                    logprob_logsumexp[token_index] = score_vector.copy()
+                else:
+                    logprob_logsumexp[token_index] = np.logaddexp(existing, score_vector)
+                counts[token_index] += 1
 
     token_positions: list[int] = []
     token_score_vectors: list[np.ndarray] = []
@@ -294,6 +316,36 @@ def iter_windows(token_ids: list[int], window_size: int) -> Iterator[tuple[int, 
     for start in range(0, len(token_ids), window_size):
         end = min(start + window_size, len(token_ids))
         yield start, token_ids[start:end]
+
+
+def iter_batches(
+    windows: Iterator[tuple[int, list[int]]],
+    batch_size: int,
+) -> Iterator[list[tuple[int, list[int]]]]:
+    batch: list[tuple[int, list[int]]] = []
+    for window in windows:
+        batch.append(window)
+        if len(batch) < batch_size:
+            continue
+        yield batch
+        batch = []
+
+    if not batch:
+        return
+    yield batch
+
+
+def build_batch_inputs(window_batch: list[tuple[int, list[int]]]) -> tuple[np.ndarray, np.ndarray]:
+    max_length = max(len(window_tokens) for _, window_tokens in window_batch)
+    input_ids = np.zeros((len(window_batch), max_length), dtype=np.int64)
+    attention_mask = np.zeros_like(input_ids, dtype=np.int64)
+
+    for batch_index, (_, window_tokens) in enumerate(window_batch):
+        length = len(window_tokens)
+        input_ids[batch_index, :length] = window_tokens
+        attention_mask[batch_index, :length] = 1
+
+    return input_ids, attention_mask
 
 
 def log_softmax(values: np.ndarray, axis: int) -> np.ndarray:

@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 
 from app.config import DEVICE, MODEL_FILE, MODEL_ID, MODEL_PATH
-from app.privacy_filter import is_classifier_loaded, load_classifier, redact_text, run_detection
+from app.privacy_filter import get_classifier, is_classifier_loaded, load_classifier, redact_text, run_detection
 from app.schemas import DetectRequest, DetectResponse, RedactRequest, RedactResponse
 
 
@@ -19,6 +19,8 @@ app = FastAPI(title="OpenAI Privacy Filter Wrapper", lifespan=lifespan)
 
 @app.get("/health")
 def health() -> dict[str, str]:
+    runtime = get_classifier() if is_classifier_loaded() else None
+
     return {
         "status": "ok",
         "model": MODEL_ID,
@@ -27,6 +29,9 @@ def health() -> dict[str, str]:
         "model_loaded": str(is_classifier_loaded()).lower(),
         "backend": "pytorch",
         "device": DEVICE,
+        "actual_device": str(runtime.model.device) if runtime is not None else "",
+        "n_ctx": str(runtime.n_ctx) if runtime is not None else "",
+        "inference_batch_size": str(runtime.inference_batch_size) if runtime is not None else "",
     }
 
 
