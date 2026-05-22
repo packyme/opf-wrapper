@@ -163,6 +163,45 @@ class ViterbiDecoder:
             path[index] = label
         return path.tolist()
 
+    def decode_torch(self, token_logprobs: object) -> list[int]:
+        import torch
+
+        if token_logprobs.ndim != 2:
+            raise ValueError("token_logprobs must have shape [seq_len, num_classes]")
+        if token_logprobs.shape[0] == 0:
+            return []
+
+        device = token_logprobs.device
+        dtype = token_logprobs.dtype
+        start_scores = torch.as_tensor(self.start_scores, device=device, dtype=dtype)
+        end_scores = torch.as_tensor(self.end_scores, device=device, dtype=dtype)
+        transition_scores = torch.as_tensor(self.transition_scores, device=device, dtype=dtype)
+
+        scores = token_logprobs[0] + start_scores
+        backpointer_dtype = torch.int16 if token_logprobs.shape[1] <= 32767 else torch.int32
+        backpointers = torch.empty(
+            (token_logprobs.shape[0] - 1, token_logprobs.shape[1]),
+            device=device,
+            dtype=backpointer_dtype,
+        )
+        for index in range(1, token_logprobs.shape[0]):
+            transitions = scores[:, None] + transition_scores
+            best_scores, best_paths = transitions.max(dim=0)
+            scores = best_scores + token_logprobs[index]
+            backpointers[index - 1] = best_paths.to(backpointer_dtype)
+
+        if not bool(torch.isfinite(scores).any().item()):
+            return token_logprobs.argmax(dim=1).detach().cpu().tolist()
+
+        scores = scores + end_scores
+        label = scores.argmax()
+        path = torch.empty((token_logprobs.shape[0],), device=device, dtype=torch.int64)
+        path[-1] = label
+        for index in range(token_logprobs.shape[0] - 2, -1, -1):
+            label = backpointers[index, label].to(torch.long)
+            path[index] = label
+        return path.detach().cpu().tolist()
+
 
 def build_label_info(id2label: dict[int | str, str]) -> LabelInfo:
     names = [id2label[key] for key in sorted(id2label, key=lambda value: int(value))]

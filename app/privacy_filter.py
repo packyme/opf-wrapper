@@ -30,7 +30,7 @@ class PyTorchTokenClassifier:
     device: Any
     torch: Any
 
-    def logits(self, input_ids: np.ndarray, attention_mask: np.ndarray) -> np.ndarray:
+    def logits_tensor(self, input_ids: np.ndarray, attention_mask: np.ndarray) -> Any:
         model_inputs = {
             "input_ids": self.torch.as_tensor(input_ids, dtype=self.torch.long, device=self.device),
             "attention_mask": self.torch.as_tensor(attention_mask, dtype=self.torch.long, device=self.device),
@@ -39,7 +39,10 @@ class PyTorchTokenClassifier:
         with self.torch.inference_mode():
             outputs = self.model(**model_inputs)
 
-        return outputs.logits.detach().float().cpu().numpy()
+        return outputs.logits.detach().float()
+
+    def logits(self, input_ids: np.ndarray, attention_mask: np.ndarray) -> np.ndarray:
+        return self.logits_tensor(input_ids=input_ids, attention_mask=attention_mask).cpu().numpy()
 
 
 @dataclass(frozen=True)
@@ -300,10 +303,11 @@ def run_detection(text: str, threshold: float) -> list[Detection]:
 
     started_at = time.perf_counter()
     selected_offsets = [offsets[index] for index in token_positions]
+    detection_logprobs = numpy_logprobs(token_logprobs)
     detections = labels_to_detections(
         text=text,
         labels=labels,
-        logprobs=token_logprobs,
+        logprobs=detection_logprobs,
         offsets=selected_offsets,
         label_info=runtime.decoder.label_info,
     )
@@ -326,11 +330,19 @@ def run_detection(text: str, threshold: float) -> list[Detection]:
 
 def decode_labels(
     runtime: PrivacyFilterRuntime,
-    token_logprobs: np.ndarray,
+    token_logprobs: Any,
     token_positions: list[int],
 ) -> list[int]:
     if runtime.decoder_mode == "argmax":
-        return token_logprobs.argmax(axis=1).tolist()
+        if isinstance(token_logprobs, np.ndarray):
+            return token_logprobs.argmax(axis=1).tolist()
+        return token_logprobs.argmax(dim=1).detach().cpu().tolist()
+
+    if should_decode_viterbi_on_device(runtime, token_logprobs):
+        labels = runtime.decoder.decode_torch(token_logprobs)
+        if len(labels) == len(token_positions):
+            return labels
+        return token_logprobs.argmax(dim=1).detach().cpu().tolist()
 
     labels = runtime.decoder.decode(token_logprobs)
     if len(labels) == len(token_positions):
@@ -341,7 +353,10 @@ def decode_labels(
 def aggregate_token_logprobs(
     runtime: PrivacyFilterRuntime,
     token_ids: list[int],
-) -> tuple[np.ndarray, list[int], dict[str, float | int]]:
+) -> tuple[Any, list[int], dict[str, float | int]]:
+    if should_keep_logprobs_on_device(runtime):
+        return aggregate_token_logprobs_torch(runtime, token_ids)
+
     logprob_logsumexp: list[np.ndarray | None] = [None] * len(token_ids)
     counts = [0] * len(token_ids)
     stats: dict[str, float | int] = {
@@ -399,6 +414,81 @@ def aggregate_token_logprobs(
     output = np.stack(token_score_vectors, axis=0)
     stats["finalize_ms"] = float(stats["finalize_ms"]) + elapsed_ms(started_at)
     return output, token_positions, stats
+
+
+def aggregate_token_logprobs_torch(
+    runtime: PrivacyFilterRuntime,
+    token_ids: list[int],
+) -> tuple[Any, list[int], dict[str, float | int]]:
+    token_logprobs: list[Any] = []
+    token_positions: list[int] = []
+    stats: dict[str, float | int] = {
+        "batches": 0,
+        "windows": 0,
+        "model_ms": 0.0,
+        "logprob_ms": 0.0,
+        "collect_ms": 0.0,
+        "finalize_ms": 0.0,
+    }
+
+    windows = iter_windows(token_ids, runtime.n_ctx)
+    for window_batch in iter_batches(windows, runtime.inference_batch_size):
+        input_ids, attention_mask = build_batch_inputs(window_batch)
+        stats["batches"] = int(stats["batches"]) + 1
+        stats["windows"] = int(stats["windows"]) + len(window_batch)
+
+        started_at = time.perf_counter()
+        batch_logits = runtime.model.logits_tensor(input_ids=input_ids, attention_mask=attention_mask)
+        synchronize_for_profile(runtime)
+        stats["model_ms"] = float(stats["model_ms"]) + elapsed_ms(started_at)
+
+        started_at = time.perf_counter()
+        batch_logprobs = runtime.model.torch.nn.functional.log_softmax(batch_logits, dim=-1)
+        synchronize_for_profile(runtime)
+        stats["logprob_ms"] = float(stats["logprob_ms"]) + elapsed_ms(started_at)
+
+        started_at = time.perf_counter()
+        for batch_index, (window_start, window_tokens) in enumerate(window_batch):
+            token_logprobs.append(batch_logprobs[batch_index, : len(window_tokens)])
+            token_positions.extend(range(window_start, window_start + len(window_tokens)))
+        stats["collect_ms"] = float(stats["collect_ms"]) + elapsed_ms(started_at)
+
+    started_at = time.perf_counter()
+    if not token_logprobs:
+        stats["finalize_ms"] = float(stats["finalize_ms"]) + elapsed_ms(started_at)
+        empty = runtime.model.torch.empty((0, 0), device=runtime.model.device, dtype=runtime.model.torch.float32)
+        return empty, [], stats
+
+    output = runtime.model.torch.cat(token_logprobs, dim=0)
+    synchronize_for_profile(runtime)
+    stats["finalize_ms"] = float(stats["finalize_ms"]) + elapsed_ms(started_at)
+    return output, token_positions, stats
+
+
+def should_keep_logprobs_on_device(runtime: PrivacyFilterRuntime) -> bool:
+    return runtime.decoder_mode == "viterbi" and runtime.model.device.type == "cuda"
+
+
+def should_decode_viterbi_on_device(runtime: PrivacyFilterRuntime, token_logprobs: Any) -> bool:
+    if runtime.decoder_mode != "viterbi":
+        return False
+    if isinstance(token_logprobs, np.ndarray):
+        return False
+    return token_logprobs.device.type == "cuda"
+
+
+def numpy_logprobs(token_logprobs: Any) -> np.ndarray:
+    if isinstance(token_logprobs, np.ndarray):
+        return token_logprobs
+    return token_logprobs.detach().float().cpu().numpy()
+
+
+def synchronize_for_profile(runtime: PrivacyFilterRuntime) -> None:
+    if not PROFILE:
+        return
+    if runtime.model.device.type != "cuda":
+        return
+    runtime.model.torch.cuda.synchronize(runtime.model.device)
 
 
 def iter_windows(token_ids: list[int], window_size: int) -> Iterator[tuple[int, list[int]]]:

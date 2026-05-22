@@ -1,5 +1,6 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import Any
 
 from fastapi import FastAPI, HTTPException
 
@@ -33,8 +34,19 @@ def health() -> dict[str, str]:
         "n_ctx": str(runtime.n_ctx) if runtime is not None else "",
         "inference_batch_size": str(runtime.inference_batch_size) if runtime is not None else "",
         "decoder": runtime.decoder_mode if runtime is not None else "",
+        "decoder_backend": decoder_backend(runtime),
         "profile": str(PROFILE).lower(),
     }
+
+
+def decoder_backend(runtime: Any | None) -> str:
+    if runtime is None:
+        return ""
+    if runtime.decoder_mode == "argmax":
+        return "argmax"
+    if runtime.model.device.type == "cuda":
+        return "torch_cuda"
+    return "numpy_cpu"
 
 
 @app.post("/detect", response_model=DetectResponse)
