@@ -10,7 +10,7 @@ from typing import Any
 import numpy as np
 from transformers import AutoConfig, PreTrainedTokenizerFast
 
-from app.config import DEVICE, INFERENCE_BATCH_SIZE, MODEL_FILE, MODEL_PATH, N_CTX, PROFILE
+from app.config import DECODER, DEVICE, INFERENCE_BATCH_SIZE, MODEL_FILE, MODEL_PATH, N_CTX, PROFILE
 from app.decoder import (
     VITERBI_BIAS_KEYS,
     ViterbiDecoder,
@@ -49,6 +49,7 @@ class PrivacyFilterRuntime:
     decoder: ViterbiDecoder
     n_ctx: int
     inference_batch_size: int
+    decoder_mode: str
 
 
 _runtime: PrivacyFilterRuntime | None = None
@@ -65,6 +66,7 @@ def load_classifier() -> PrivacyFilterRuntime:
     tokenizer = load_tokenizer()
     n_ctx = resolve_n_ctx(config)
     inference_batch_size = resolve_inference_batch_size()
+    decoder_mode = resolve_decoder_mode()
     label_info = build_label_info(config.id2label)
     decoder = ViterbiDecoder(label_info=label_info, **load_viterbi_biases())
     model = load_pytorch_model()
@@ -74,6 +76,7 @@ def load_classifier() -> PrivacyFilterRuntime:
         decoder=decoder,
         n_ctx=n_ctx,
         inference_batch_size=inference_batch_size,
+        decoder_mode=decoder_mode,
     )
     return _runtime
 
@@ -207,6 +210,13 @@ def resolve_inference_batch_size() -> int:
     return value
 
 
+def resolve_decoder_mode() -> str:
+    mode = DECODER.strip().lower()
+    if mode in {"viterbi", "argmax"}:
+        return mode
+    raise ValueError("OPF_DECODER must be viterbi or argmax")
+
+
 def ensure_model_dir() -> None:
     MODEL_PATH.mkdir(parents=True, exist_ok=True)
 
@@ -285,9 +295,7 @@ def run_detection(text: str, threshold: float) -> list[Detection]:
         return []
 
     started_at = time.perf_counter()
-    labels = runtime.decoder.decode(token_logprobs)
-    if len(labels) != len(token_positions):
-        labels = token_logprobs.argmax(axis=1).tolist()
+    labels = decode_labels(runtime, token_logprobs, token_positions)
     decode_ms = elapsed_ms(started_at)
 
     started_at = time.perf_counter()
@@ -314,6 +322,20 @@ def run_detection(text: str, threshold: float) -> list[Detection]:
         spans_ms=spans_ms,
     )
     return selected
+
+
+def decode_labels(
+    runtime: PrivacyFilterRuntime,
+    token_logprobs: np.ndarray,
+    token_positions: list[int],
+) -> list[int]:
+    if runtime.decoder_mode == "argmax":
+        return token_logprobs.argmax(axis=1).tolist()
+
+    labels = runtime.decoder.decode(token_logprobs)
+    if len(labels) == len(token_positions):
+        return labels
+    return token_logprobs.argmax(axis=1).tolist()
 
 
 def aggregate_token_logprobs(

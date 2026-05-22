@@ -32,6 +32,7 @@ def health() -> dict[str, str]:
         "actual_device": str(runtime.model.device) if runtime is not None else "",
         "n_ctx": str(runtime.n_ctx) if runtime is not None else "",
         "inference_batch_size": str(runtime.inference_batch_size) if runtime is not None else "",
+        "decoder": runtime.decoder_mode if runtime is not None else "",
         "profile": str(PROFILE).lower(),
     }
 
