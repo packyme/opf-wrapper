@@ -13,3 +13,4 @@ MODEL_FILE = os.getenv("OPF_MODEL_FILE", "model.safetensors")
 DEVICE = os.getenv("OPF_DEVICE", "cpu")
 N_CTX = os.getenv("OPF_N_CTX")
 INFERENCE_BATCH_SIZE = os.getenv("OPF_INFERENCE_BATCH_SIZE", "1")
+PROFILE = os.getenv("OPF_PROFILE", "").lower() in {"1", "true", "yes", "on"}

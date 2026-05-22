@@ -1,5 +1,7 @@
 import json
+import logging
 import sys
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from types import ModuleType
@@ -8,7 +10,7 @@ from typing import Any
 import numpy as np
 from transformers import AutoConfig, PreTrainedTokenizerFast
 
-from app.config import DEVICE, INFERENCE_BATCH_SIZE, MODEL_FILE, MODEL_PATH, N_CTX
+from app.config import DEVICE, INFERENCE_BATCH_SIZE, MODEL_FILE, MODEL_PATH, N_CTX, PROFILE
 from app.decoder import (
     VITERBI_BIAS_KEYS,
     ViterbiDecoder,
@@ -17,6 +19,9 @@ from app.decoder import (
     select_non_overlapping_detections,
 )
 from app.schemas import Detection
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -235,26 +240,57 @@ def is_classifier_loaded() -> bool:
 
 
 def run_detection(text: str, threshold: float) -> list[Detection]:
+    total_started_at = time.perf_counter()
     runtime = get_classifier()
+
+    started_at = time.perf_counter()
     tokenized = runtime.tokenizer(
         text,
         add_special_tokens=False,
         return_offsets_mapping=True,
     )
+    tokenize_ms = elapsed_ms(started_at)
 
+    started_at = time.perf_counter()
     token_ids = [int(token_id) for token_id in tokenized["input_ids"]]
     offsets = [(int(start), int(end)) for start, end in tokenized["offset_mapping"]]
+    prepare_ms = elapsed_ms(started_at)
     if not token_ids:
+        log_detection_profile(
+            text=text,
+            tokens=0,
+            detections=0,
+            total_ms=elapsed_ms(total_started_at),
+            tokenize_ms=tokenize_ms,
+            prepare_ms=prepare_ms,
+            inference_stats={},
+            decode_ms=0.0,
+            spans_ms=0.0,
+        )
         return []
 
-    token_logprobs, token_positions = aggregate_token_logprobs(runtime, token_ids)
+    token_logprobs, token_positions, inference_stats = aggregate_token_logprobs(runtime, token_ids)
     if not token_positions:
+        log_detection_profile(
+            text=text,
+            tokens=len(token_ids),
+            detections=0,
+            total_ms=elapsed_ms(total_started_at),
+            tokenize_ms=tokenize_ms,
+            prepare_ms=prepare_ms,
+            inference_stats=inference_stats,
+            decode_ms=0.0,
+            spans_ms=0.0,
+        )
         return []
 
+    started_at = time.perf_counter()
     labels = runtime.decoder.decode(token_logprobs)
     if len(labels) != len(token_positions):
         labels = token_logprobs.argmax(axis=1).tolist()
+    decode_ms = elapsed_ms(started_at)
 
+    started_at = time.perf_counter()
     selected_offsets = [offsets[index] for index in token_positions]
     detections = labels_to_detections(
         text=text,
@@ -264,27 +300,56 @@ def run_detection(text: str, threshold: float) -> list[Detection]:
         label_info=runtime.decoder.label_info,
     )
     filtered = [detection for detection in detections if detection.score >= threshold]
-    return select_non_overlapping_detections(filtered)
+    selected = select_non_overlapping_detections(filtered)
+    spans_ms = elapsed_ms(started_at)
+    log_detection_profile(
+        text=text,
+        tokens=len(token_ids),
+        detections=len(selected),
+        total_ms=elapsed_ms(total_started_at),
+        tokenize_ms=tokenize_ms,
+        prepare_ms=prepare_ms,
+        inference_stats=inference_stats,
+        decode_ms=decode_ms,
+        spans_ms=spans_ms,
+    )
+    return selected
 
 
 def aggregate_token_logprobs(
     runtime: PrivacyFilterRuntime,
     token_ids: list[int],
-) -> tuple[np.ndarray, list[int]]:
+) -> tuple[np.ndarray, list[int], dict[str, float | int]]:
     logprob_logsumexp: list[np.ndarray | None] = [None] * len(token_ids)
     counts = [0] * len(token_ids)
+    stats: dict[str, float | int] = {
+        "batches": 0,
+        "windows": 0,
+        "model_ms": 0.0,
+        "logprob_ms": 0.0,
+        "collect_ms": 0.0,
+        "finalize_ms": 0.0,
+    }
 
     windows = iter_windows(token_ids, runtime.n_ctx)
     for window_batch in iter_batches(windows, runtime.inference_batch_size):
         input_ids, attention_mask = build_batch_inputs(window_batch)
+        stats["batches"] = int(stats["batches"]) + 1
+        stats["windows"] = int(stats["windows"]) + len(window_batch)
+
+        started_at = time.perf_counter()
         batch_logits = runtime.model.logits(input_ids=input_ids, attention_mask=attention_mask)
+        stats["model_ms"] = float(stats["model_ms"]) + elapsed_ms(started_at)
 
         for batch_index, (window_start, window_tokens) in enumerate(window_batch):
             logits = batch_logits[batch_index, : len(window_tokens)]
+            started_at = time.perf_counter()
             logprobs = log_softmax(logits.astype(np.float32, copy=False), axis=-1)
+            stats["logprob_ms"] = float(stats["logprob_ms"]) + elapsed_ms(started_at)
             if logprobs.shape[0] != len(window_tokens):
                 raise ValueError("Logprob output length does not match window length")
 
+            started_at = time.perf_counter()
             for token_pos, score_vector in enumerate(logprobs):
                 token_index = window_start + token_pos
                 existing = logprob_logsumexp[token_index]
@@ -293,7 +358,9 @@ def aggregate_token_logprobs(
                 else:
                     logprob_logsumexp[token_index] = np.logaddexp(existing, score_vector)
                 counts[token_index] += 1
+            stats["collect_ms"] = float(stats["collect_ms"]) + elapsed_ms(started_at)
 
+    started_at = time.perf_counter()
     token_positions: list[int] = []
     token_score_vectors: list[np.ndarray] = []
     for token_index, score_sum in enumerate(logprob_logsumexp):
@@ -304,9 +371,12 @@ def aggregate_token_logprobs(
         token_score_vectors.append(score_sum - np.log(float(count)))
 
     if not token_score_vectors:
-        return np.empty((0, 0), dtype=np.float32), []
+        stats["finalize_ms"] = float(stats["finalize_ms"]) + elapsed_ms(started_at)
+        return np.empty((0, 0), dtype=np.float32), [], stats
 
-    return np.stack(token_score_vectors, axis=0), token_positions
+    output = np.stack(token_score_vectors, axis=0)
+    stats["finalize_ms"] = float(stats["finalize_ms"]) + elapsed_ms(started_at)
+    return output, token_positions, stats
 
 
 def iter_windows(token_ids: list[int], window_size: int) -> Iterator[tuple[int, list[int]]]:
@@ -352,6 +422,45 @@ def log_softmax(values: np.ndarray, axis: int) -> np.ndarray:
     max_values = np.max(values, axis=axis, keepdims=True)
     shifted = values - max_values
     return shifted - np.log(np.sum(np.exp(shifted), axis=axis, keepdims=True))
+
+
+def elapsed_ms(started_at: float) -> float:
+    return (time.perf_counter() - started_at) * 1000.0
+
+
+def log_detection_profile(
+    text: str,
+    tokens: int,
+    detections: int,
+    total_ms: float,
+    tokenize_ms: float,
+    prepare_ms: float,
+    inference_stats: dict[str, float | int],
+    decode_ms: float,
+    spans_ms: float,
+) -> None:
+    if not PROFILE:
+        return
+
+    logger.info(
+        "opf_profile chars=%d tokens=%d detections=%d batches=%d windows=%d total_ms=%.2f "
+        "tokenize_ms=%.2f prepare_ms=%.2f model_ms=%.2f logprob_ms=%.2f collect_ms=%.2f "
+        "finalize_ms=%.2f decode_ms=%.2f spans_ms=%.2f",
+        len(text),
+        tokens,
+        detections,
+        int(inference_stats.get("batches", 0)),
+        int(inference_stats.get("windows", 0)),
+        total_ms,
+        tokenize_ms,
+        prepare_ms,
+        float(inference_stats.get("model_ms", 0.0)),
+        float(inference_stats.get("logprob_ms", 0.0)),
+        float(inference_stats.get("collect_ms", 0.0)),
+        float(inference_stats.get("finalize_ms", 0.0)),
+        decode_ms,
+        spans_ms,
+    )
 
 
 def redact_text(text: str, detections: list[Detection], mask: str | None) -> str:

@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
 
-from app.config import DEVICE, MODEL_FILE, MODEL_ID, MODEL_PATH
+from app.config import DEVICE, MODEL_FILE, MODEL_ID, MODEL_PATH, PROFILE
 from app.privacy_filter import get_classifier, is_classifier_loaded, load_classifier, redact_text, run_detection
 from app.schemas import DetectRequest, DetectResponse, RedactRequest, RedactResponse
 
@@ -32,6 +32,7 @@ def health() -> dict[str, str]:
         "actual_device": str(runtime.model.device) if runtime is not None else "",
         "n_ctx": str(runtime.n_ctx) if runtime is not None else "",
         "inference_batch_size": str(runtime.inference_batch_size) if runtime is not None else "",
+        "profile": str(PROFILE).lower(),
     }
 
 
