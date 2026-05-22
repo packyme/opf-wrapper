@@ -21,7 +21,7 @@ from app.decoder import (
 from app.schemas import Detection
 
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("uvicorn.error")
 
 
 @dataclass(frozen=True)
