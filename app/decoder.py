@@ -64,6 +64,7 @@ class ViterbiDecoder:
                     next_tag,
                     next_span,
                 )
+        self.build_sparse_plan()
 
     def can_start(self, label_id: int, tag: str | None) -> bool:
         if label_id == self.label_info.background_token_label:
@@ -132,7 +133,60 @@ class ViterbiDecoder:
             return True
         return span == self.label_info.background_span_label
 
+    def build_sparse_plan(self) -> None:
+        num_classes = len(self.label_info.token_to_span_label)
+        background = self.label_info.background_token_label
+        span_to_b: dict[int, int] = {}
+        span_to_i: dict[int, int] = {}
+        end_sources: list[int] = []
+        start_targets: list[int] = []
+        continue_targets: list[int] = []
+        continue_sources: list[tuple[int, int]] = []
+        end_targets: list[int] = []
+        end_target_sources: list[tuple[int, int]] = []
+
+        for label_id in range(num_classes):
+            tag = self.label_info.token_boundary_tags.get(label_id)
+            span = self.label_info.token_to_span_label.get(label_id)
+            if label_id == background or span == self.label_info.background_span_label:
+                continue
+            if tag in {"E", "S"}:
+                end_sources.append(label_id)
+            if tag in {"B", "S"}:
+                start_targets.append(label_id)
+            if tag == "B":
+                span_to_b[span] = label_id
+            if tag == "I":
+                span_to_i[span] = label_id
+
+        for label_id in range(num_classes):
+            tag = self.label_info.token_boundary_tags.get(label_id)
+            span = self.label_info.token_to_span_label.get(label_id)
+            if span is None:
+                continue
+            b_label = span_to_b.get(span)
+            i_label = span_to_i.get(span)
+            if b_label is None or i_label is None:
+                continue
+            source_pair = tuple(sorted((b_label, i_label)))
+            if tag == "I":
+                continue_targets.append(label_id)
+                continue_sources.append(source_pair)
+            if tag == "E":
+                end_targets.append(label_id)
+                end_target_sources.append(source_pair)
+
+        self.sparse_end_sources = np.asarray(end_sources, dtype=np.int64)
+        self.sparse_start_targets = np.asarray(start_targets, dtype=np.int64)
+        self.sparse_continue_targets = np.asarray(continue_targets, dtype=np.int64)
+        self.sparse_continue_sources = np.asarray(continue_sources, dtype=np.int64).reshape(-1, 2)
+        self.sparse_end_targets = np.asarray(end_targets, dtype=np.int64)
+        self.sparse_end_target_sources = np.asarray(end_target_sources, dtype=np.int64).reshape(-1, 2)
+
     def decode(self, token_logprobs: np.ndarray) -> list[int]:
+        return self.decode_sparse(token_logprobs)
+
+    def decode_dense(self, token_logprobs: np.ndarray) -> list[int]:
         if token_logprobs.ndim != 2:
             raise ValueError("token_logprobs must have shape [seq_len, num_classes]")
         if token_logprobs.shape[0] == 0:
@@ -162,6 +216,120 @@ class ViterbiDecoder:
             label = int(backpointers[index, label])
             path[index] = label
         return path.tolist()
+
+    def decode_sparse(self, token_logprobs: np.ndarray) -> list[int]:
+        if token_logprobs.ndim != 2:
+            raise ValueError("token_logprobs must have shape [seq_len, num_classes]")
+        if token_logprobs.shape[0] == 0:
+            return []
+
+        start_scores = self.start_scores.astype(token_logprobs.dtype, copy=False)
+        end_scores = self.end_scores.astype(token_logprobs.dtype, copy=False)
+        scores = token_logprobs[0] + start_scores
+        backpointer_dtype = np.int16 if token_logprobs.shape[1] <= 32767 else np.int32
+        backpointers = np.empty((token_logprobs.shape[0] - 1, token_logprobs.shape[1]), dtype=backpointer_dtype)
+        background = self.label_info.background_token_label
+
+        for index in range(1, token_logprobs.shape[0]):
+            next_scores = np.full_like(scores, NEG_INF)
+            backpointer_row = backpointers[index - 1]
+            best_end_label, best_end_score = self.best_end_source(scores)
+            emission = token_logprobs[index]
+
+            background_score = scores[background] + self.transition_bias_background_stay
+            end_to_background_score = best_end_score + self.transition_bias_end_to_background
+            if self.prefers_first_candidate(background_score, background, end_to_background_score, best_end_label):
+                next_scores[background] = background_score + emission[background]
+                backpointer_row[background] = background
+            else:
+                next_scores[background] = end_to_background_score + emission[background]
+                backpointer_row[background] = best_end_label
+
+            background_to_start_score = scores[background] + self.transition_bias_background_to_start
+            end_to_start_score = best_end_score + self.transition_bias_end_to_start
+            if self.prefers_first_candidate(background_to_start_score, background, end_to_start_score, best_end_label):
+                start_score = background_to_start_score
+                start_label = background
+            else:
+                start_score = end_to_start_score
+                start_label = best_end_label
+            if self.sparse_start_targets.size:
+                next_scores[self.sparse_start_targets] = start_score + emission[self.sparse_start_targets]
+                backpointer_row[self.sparse_start_targets] = start_label
+
+            self.apply_same_span_transitions(
+                next_scores=next_scores,
+                backpointer_row=backpointer_row,
+                scores=scores,
+                emission=emission,
+                targets=self.sparse_continue_targets,
+                sources=self.sparse_continue_sources,
+                bias=self.transition_bias_inside_to_continue,
+            )
+            self.apply_same_span_transitions(
+                next_scores=next_scores,
+                backpointer_row=backpointer_row,
+                scores=scores,
+                emission=emission,
+                targets=self.sparse_end_targets,
+                sources=self.sparse_end_target_sources,
+                bias=self.transition_bias_inside_to_end,
+            )
+            scores = next_scores
+
+        if not np.isfinite(scores).any():
+            return token_logprobs.argmax(axis=1).tolist()
+
+        scores = scores + end_scores
+        label = int(scores.argmax())
+        path = np.empty((token_logprobs.shape[0],), dtype=np.int64)
+        path[-1] = label
+        for index in range(token_logprobs.shape[0] - 2, -1, -1):
+            label = int(backpointers[index, label])
+            path[index] = label
+        return path.tolist()
+
+    def best_end_source(self, scores: np.ndarray) -> tuple[int, float]:
+        if self.sparse_end_sources.size == 0:
+            return self.label_info.background_token_label, float(NEG_INF)
+
+        end_scores = scores[self.sparse_end_sources]
+        best_index = int(end_scores.argmax())
+        return int(self.sparse_end_sources[best_index]), float(end_scores[best_index])
+
+    def apply_same_span_transitions(
+        self,
+        next_scores: np.ndarray,
+        backpointer_row: np.ndarray,
+        scores: np.ndarray,
+        emission: np.ndarray,
+        targets: np.ndarray,
+        sources: np.ndarray,
+        bias: float,
+    ) -> None:
+        if targets.size == 0:
+            return
+
+        candidate_scores = scores[sources]
+        best_offsets = candidate_scores.argmax(axis=1)
+        row_indices = np.arange(targets.shape[0])
+        best_sources = sources[row_indices, best_offsets]
+        best_scores = candidate_scores[row_indices, best_offsets] + bias
+        next_scores[targets] = best_scores + emission[targets]
+        backpointer_row[targets] = best_sources
+
+    def prefers_first_candidate(
+        self,
+        first_score: float,
+        first_label: int,
+        second_score: float,
+        second_label: int,
+    ) -> bool:
+        if first_score > second_score:
+            return True
+        if first_score < second_score:
+            return False
+        return first_label <= second_label
 
     def decode_torch(self, token_logprobs: object) -> list[int]:
         import torch

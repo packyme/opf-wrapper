@@ -10,7 +10,7 @@ from typing import Any
 import numpy as np
 from transformers import AutoConfig, PreTrainedTokenizerFast
 
-from app.config import DECODER, DEVICE, INFERENCE_BATCH_SIZE, MODEL_FILE, MODEL_PATH, N_CTX, PROFILE
+from app.config import DECODER, DEVICE, INFERENCE_BATCH_SIZE, MODEL_FILE, MODEL_PATH, N_CTX, PROFILE, VITERBI_BACKEND
 from app.decoder import (
     VITERBI_BIAS_KEYS,
     ViterbiDecoder,
@@ -53,6 +53,7 @@ class PrivacyFilterRuntime:
     n_ctx: int
     inference_batch_size: int
     decoder_mode: str
+    viterbi_backend: str
 
 
 _runtime: PrivacyFilterRuntime | None = None
@@ -70,6 +71,7 @@ def load_classifier() -> PrivacyFilterRuntime:
     n_ctx = resolve_n_ctx(config)
     inference_batch_size = resolve_inference_batch_size()
     decoder_mode = resolve_decoder_mode()
+    viterbi_backend = resolve_viterbi_backend()
     label_info = build_label_info(config.id2label)
     decoder = ViterbiDecoder(label_info=label_info, **load_viterbi_biases())
     model = load_pytorch_model()
@@ -80,6 +82,7 @@ def load_classifier() -> PrivacyFilterRuntime:
         n_ctx=n_ctx,
         inference_batch_size=inference_batch_size,
         decoder_mode=decoder_mode,
+        viterbi_backend=viterbi_backend,
     )
     return _runtime
 
@@ -220,6 +223,13 @@ def resolve_decoder_mode() -> str:
     raise ValueError("OPF_DECODER must be viterbi or argmax")
 
 
+def resolve_viterbi_backend() -> str:
+    backend = VITERBI_BACKEND.strip().lower()
+    if backend in {"sparse", "dense", "cuda"}:
+        return backend
+    raise ValueError("OPF_VITERBI_BACKEND must be sparse, dense, or cuda")
+
+
 def ensure_model_dir() -> None:
     MODEL_PATH.mkdir(parents=True, exist_ok=True)
 
@@ -344,7 +354,10 @@ def decode_labels(
             return labels
         return token_logprobs.argmax(dim=1).detach().cpu().tolist()
 
-    labels = runtime.decoder.decode(token_logprobs)
+    if runtime.viterbi_backend == "dense":
+        labels = runtime.decoder.decode_dense(token_logprobs)
+    else:
+        labels = runtime.decoder.decode(token_logprobs)
     if len(labels) == len(token_positions):
         return labels
     return token_logprobs.argmax(axis=1).tolist()
@@ -466,11 +479,13 @@ def aggregate_token_logprobs_torch(
 
 
 def should_keep_logprobs_on_device(runtime: PrivacyFilterRuntime) -> bool:
-    return runtime.decoder_mode == "viterbi" and runtime.model.device.type == "cuda"
+    return runtime.decoder_mode == "viterbi" and runtime.viterbi_backend == "cuda" and runtime.model.device.type == "cuda"
 
 
 def should_decode_viterbi_on_device(runtime: PrivacyFilterRuntime, token_logprobs: Any) -> bool:
     if runtime.decoder_mode != "viterbi":
+        return False
+    if runtime.viterbi_backend != "cuda":
         return False
     if isinstance(token_logprobs, np.ndarray):
         return False

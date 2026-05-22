@@ -34,6 +34,7 @@ def health() -> dict[str, str]:
         "n_ctx": str(runtime.n_ctx) if runtime is not None else "",
         "inference_batch_size": str(runtime.inference_batch_size) if runtime is not None else "",
         "decoder": runtime.decoder_mode if runtime is not None else "",
+        "viterbi_backend": runtime.viterbi_backend if runtime is not None else "",
         "decoder_backend": decoder_backend(runtime),
         "profile": str(PROFILE).lower(),
     }
@@ -44,9 +45,11 @@ def decoder_backend(runtime: Any | None) -> str:
         return ""
     if runtime.decoder_mode == "argmax":
         return "argmax"
-    if runtime.model.device.type == "cuda":
+    if runtime.viterbi_backend == "cuda" and runtime.model.device.type == "cuda":
         return "torch_cuda"
-    return "numpy_cpu"
+    if runtime.viterbi_backend == "dense":
+        return "numpy_dense"
+    return "numpy_sparse"
 
 
 @app.post("/detect", response_model=DetectResponse)
